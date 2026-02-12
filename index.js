@@ -1,11 +1,12 @@
 const axios = require('axios');
-const cheerio = require('cheerio');
 const nodemailer = require('nodemailer');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
-const URL = 'https://github.com/Monkfishare/New_Yorker/tree/main/NY/2026';
+const OWNER = 'Monkfishare';
+const REPO = 'New_Yorker';
+const PATH = 'NY/2026';
 const TRACKING_FILE = path.join(__dirname, 'downloaded_files.json');
 
 // Ensure tracking file exists
@@ -16,73 +17,95 @@ if (!fs.existsSync(TRACKING_FILE)) {
 const downloadedFiles = JSON.parse(fs.readFileSync(TRACKING_FILE));
 
 async function main() {
-    console.log(`Checking ${URL} for new .epub issues...`);
+    console.log(`Checking GitHub API for new issues in ${PATH}...`);
     
     try {
-        const response = await axios.get(URL);
-        const $ = cheerio.load(response.data);
-        const links = [];
-
-        // Updated selector for GitHub's latest UI (sometimes it's tricky)
-        // Usually href ends with .epub
-        $('a[href$=".epub"]').each((i, el) => {
-            let href = $(el).attr('href');
-            if (href) {
-                // If it's a blob link, convert to raw
-                // /User/Repo/blob/main/path/file.epub -> https://raw.githubusercontent.com/User/Repo/main/path/file.epub
-                const rawUrl = 'https://raw.githubusercontent.com' + href.replace('/blob/', '/');
-                const filename = path.basename(href);
-                links.push({ filename, url: rawUrl });
-            }
+        // Step 1: List folders (dates) in NY/2026
+        const apiUrl = `https://api.github.com/repos/${OWNER}/${REPO}/contents/${PATH}`;
+        const response = await axios.get(apiUrl, {
+            headers: { 'User-Agent': 'KindleSender/1.0' }
         });
 
-        const newFiles = links.filter(file => !downloadedFiles.includes(file.filename));
+        // Filter for directories (subfolders)
+        const dateFolders = response.data
+            .filter(item => item.type === 'dir')
+            .map(item => item.name)
+            .sort() // Dates sort correctly as strings: 2026-02-09
+            .reverse(); // Latest first
 
-        if (newFiles.length === 0) {
-            console.log('No new issues found.');
+        if (dateFolders.length === 0) {
+            console.log('No date folders found in 2026.');
             return;
         }
 
-        console.log(`Found ${newFiles.length} new issue(s): ${newFiles.map(f => f.filename).join(', ')}`);
+        console.log(`Found ${dateFolders.length} folders. Latest: ${dateFolders[0]}`);
 
-        // Configure Nodemailer
-        const transporter = nodemailer.createTransport({
-            service: 'gmail',
-            auth: {
-                user: process.env.GOOGLE_EMAIL,
-                pass: process.env.GOOGLE_PASSWORD
-            }
-        });
+        // Step 2: Check each folder (starting with latest) for new .epub files
+        for (const folderDate of dateFolders) {
+            // Optimization: If we've already processed this folder's EPUB, we might skip it?
+            // But let's check inside just in case (filenames might differ).
+            
+            const folderUrl = `https://api.github.com/repos/${OWNER}/${REPO}/contents/${PATH}/${folderDate}`;
+            const folderResponse = await axios.get(folderUrl, {
+                headers: { 'User-Agent': 'KindleSender/1.0' }
+            });
 
-        for (const file of newFiles) {
-            console.log(`Downloading ${file.filename}...`);
-            try {
-                const response = await axios.get(file.url, { responseType: 'arraybuffer' });
-                
-                console.log(`Sending ${file.filename} to Kindle (${process.env.KINDLE_EMAIL})...`);
-                await transporter.sendMail({
-                    from: process.env.GOOGLE_EMAIL,
-                    to: process.env.KINDLE_EMAIL,
-                    subject: 'New Yorker Issue',
-                    text: 'Here is the latest issue.',
-                    attachments: [
-                        {
-                            filename: file.filename,
-                            content: response.data
-                        }
-                    ]
-                });
+            const epubFiles = folderResponse.data.filter(file => file.name.endsWith('.epub'));
 
-                console.log(`Sent: ${file.filename}`);
-                downloadedFiles.push(file.filename);
-                fs.writeFileSync(TRACKING_FILE, JSON.stringify(downloadedFiles, null, 2));
-            } catch (err) {
-                console.error(`Failed to process ${file.filename}: ${err.message}`);
+            for (const file of epubFiles) {
+                if (downloadedFiles.includes(file.name)) {
+                    console.log(`Skipping already downloaded: ${file.name}`);
+                    continue;
+                }
+
+                console.log(`Found new issue: ${file.name} in ${folderDate}`);
+
+                // Step 3: Download and Send
+                await downloadAndSend(file);
             }
         }
 
     } catch (error) {
         console.error('Error:', error.message);
+        if (error.response && error.response.status === 403) {
+            console.log("Rate limited by GitHub API.");
+        }
+    }
+}
+
+async function downloadAndSend(file) {
+    // Configure Nodemailer
+    const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+            user: process.env.GOOGLE_EMAIL,
+            pass: process.env.GOOGLE_PASSWORD
+        }
+    });
+
+    console.log(`Downloading ${file.name}...`);
+    try {
+        const fileResponse = await axios.get(file.download_url, { responseType: 'arraybuffer' });
+        
+        console.log(`Sending ${file.name} to Kindle (${process.env.KINDLE_EMAIL})...`);
+        await transporter.sendMail({
+            from: process.env.GOOGLE_EMAIL,
+            to: process.env.KINDLE_EMAIL,
+            subject: 'New Yorker Issue',
+            text: 'Here is the latest issue.',
+            attachments: [
+                {
+                    filename: file.name,
+                    content: fileResponse.data
+                }
+            ]
+        });
+
+        console.log(`Sent: ${file.name}`);
+        downloadedFiles.push(file.name);
+        fs.writeFileSync(TRACKING_FILE, JSON.stringify(downloadedFiles, null, 2));
+    } catch (err) {
+        console.error(`Failed to send ${file.name}: ${err.message}`);
     }
 }
 
