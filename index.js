@@ -1,111 +1,116 @@
 const axios = require('axios');
-const nodemailer = require('nodemailer');
 const fs = require('fs');
 const path = require('path');
-require('dotenv').config();
+const { exec } = require('child_process');
+require('dotenv').config({ path: path.join(__dirname, '.secrets.env') });
 
 const OWNER = 'Monkfishare';
 const REPO = 'New_Yorker';
 const PATH = 'NY/2026';
 const TRACKING_FILE = path.join(__dirname, 'downloaded_files.json');
+const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 
-// Ensure tracking file exists
 if (!fs.existsSync(TRACKING_FILE)) {
     fs.writeFileSync(TRACKING_FILE, JSON.stringify([]));
+}
+if (!fs.existsSync(DOWNLOADS_DIR)) {
+    fs.mkdirSync(DOWNLOADS_DIR);
 }
 
 const downloadedFiles = JSON.parse(fs.readFileSync(TRACKING_FILE));
 
 async function main() {
-    console.log(`Checking GitHub API for new issues in ${PATH}...`);
+    console.log(`[${new Date().toISOString()}] Checking GitHub API...`);
     
     try {
-        // Step 1: List folders (dates) in NY/2026
         const apiUrl = `https://api.github.com/repos/${OWNER}/${REPO}/contents/${PATH}`;
-        const response = await axios.get(apiUrl, {
-            headers: { 'User-Agent': 'KindleSender/1.0' }
-        });
+        const response = await axios.get(apiUrl, { headers: { 'User-Agent': 'KindleSender/1.0' } });
 
-        // Filter for directories (subfolders)
         const dateFolders = response.data
             .filter(item => item.type === 'dir')
             .map(item => item.name)
-            .sort() // Dates sort correctly as strings: 2026-02-09
-            .reverse(); // Latest first
+            .sort()
+            .reverse();
 
         if (dateFolders.length === 0) {
-            console.log('No date folders found in 2026.');
+            console.log('No date folders found.');
             return;
         }
 
-        console.log(`Found ${dateFolders.length} folders. Latest: ${dateFolders[0]}`);
-
-        // Step 2: Check each folder (starting with latest) for new .epub files
         for (const folderDate of dateFolders) {
-            // Optimization: If we've already processed this folder's EPUB, we might skip it?
-            // But let's check inside just in case (filenames might differ).
-            
             const folderUrl = `https://api.github.com/repos/${OWNER}/${REPO}/contents/${PATH}/${folderDate}`;
-            const folderResponse = await axios.get(folderUrl, {
-                headers: { 'User-Agent': 'KindleSender/1.0' }
-            });
-
+            const folderResponse = await axios.get(folderUrl, { headers: { 'User-Agent': 'KindleSender/1.0' } });
             const epubFiles = folderResponse.data.filter(file => file.name.endsWith('.epub'));
 
             for (const file of epubFiles) {
-                if (downloadedFiles.includes(file.name)) {
-                    console.log(`Skipping already downloaded: ${file.name}`);
-                    continue;
+                const localPath = path.join(DOWNLOADS_DIR, file.name);
+                const isTracked = downloadedFiles.includes(file.name);
+                const existsLocally = fs.existsSync(localPath);
+
+                if (isTracked) {
+                    continue; // Skip silently if tracked
                 }
 
-                console.log(`Found new issue: ${file.name} in ${folderDate}`);
-
-                // Step 3: Download and Send
-                await downloadAndSend(file);
+                console.log(`Found new issue: ${file.name}`);
+                await downloadAndSend(file, localPath);
             }
         }
 
     } catch (error) {
         console.error('Error:', error.message);
-        if (error.response && error.response.status === 403) {
-            console.log("Rate limited by GitHub API.");
-        }
     }
 }
 
-async function downloadAndSend(file) {
-    // Configure Nodemailer
-    const transporter = nodemailer.createTransport({
-        service: 'gmail',
-        auth: {
-            user: process.env.GOOGLE_EMAIL,
-            pass: process.env.GOOGLE_PASSWORD
-        }
-    });
-
+async function downloadAndSend(file, localPath) {
     console.log(`Downloading ${file.name}...`);
     try {
         const fileResponse = await axios.get(file.download_url, { responseType: 'arraybuffer' });
+        fs.writeFileSync(localPath, fileResponse.data);
         
-        console.log(`Sending ${file.name} to Kindle (${process.env.KINDLE_EMAIL})...`);
-        await transporter.sendMail({
-            from: process.env.GOOGLE_EMAIL,
-            to: process.env.KINDLE_EMAIL,
-            subject: 'New Yorker Issue',
-            text: 'Here is the latest issue.',
-            attachments: [
-                {
-                    filename: file.name,
-                    content: fileResponse.data
-                }
-            ]
-        });
+        await sendViaMacMail(file.name, localPath);
+        await sendTelegramNotification(`📚 Sent New Yorker to Kindle: ${file.name}`);
 
-        console.log(`Sent: ${file.name}`);
         downloadedFiles.push(file.name);
         fs.writeFileSync(TRACKING_FILE, JSON.stringify(downloadedFiles, null, 2));
     } catch (err) {
-        console.error(`Failed to send ${file.name}: ${err.message}`);
+        console.error(`Failed to process ${file.name}: ${err.message}`);
+    }
+}
+
+function sendViaMacMail(filename, filePath) {
+    return new Promise((resolve, reject) => {
+        console.log(`Sending email...`);
+        const recipient = process.env.KINDLE_EMAIL || 'liushuanguni_1IPvlo@kindle.com';
+        const script = `
+            tell application "Mail"
+                set theMessage to make new outgoing message with properties {subject:"New Yorker Issue", content:"New issue attached.", visible:false}
+                tell theMessage
+                    make new to recipient at end of to recipients with properties {address:"${recipient}"}
+                    make new attachment with properties {file name:(POSIX file "${filePath}")} at after the last paragraph
+                    send
+                end tell
+            end tell
+        `;
+        exec(`osascript -e '${script}'`, (error, stdout) => {
+            if (error) reject(error);
+            else resolve(stdout);
+        });
+    });
+}
+
+async function sendTelegramNotification(text) {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+    if (!token || !chatId) return;
+
+    try {
+        await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+            chat_id: chatId,
+            text: text
+        });
+        console.log('Telegram notification sent.');
+    } catch (err) {
+        console.error('Telegram failed:', err.message);
     }
 }
 
