@@ -68,6 +68,7 @@ async function downloadAndSend(file, localPath) {
         fs.writeFileSync(localPath, fileResponse.data);
         
         await sendViaMacMail(file.name, localPath);
+        await sendConfirmationEmail(file.name);
         await sendTelegramNotification(`📚 Sent New Yorker to Kindle: ${file.name}`);
 
         downloadedFiles.push(file.name);
@@ -112,6 +113,26 @@ async function sendTelegramNotification(text) {
     } catch (err) {
         console.error('Telegram failed:', err.message);
     }
+}
+
+function sendConfirmationEmail(filename) {
+    return new Promise((resolve, reject) => {
+        console.log(`Sending confirmation email...`);
+        const recipient = 'liushuanguni@gmail.com';
+        const script = `
+            tell application "Mail"
+                set theMessage to make new outgoing message with properties {subject:"New Yorker Issue Sent", content:"The issue ${filename} has been sent to your Kindle.", visible:false}
+                tell theMessage
+                    make new to recipient at end of to recipients with properties {address:"${recipient}"}
+                    send
+                end tell
+            end tell
+        `;
+        exec(`osascript -e '${script}'`, (error, stdout) => {
+            if (error) reject(error);
+            else resolve(stdout);
+        });
+    });
 }
 
 main();
